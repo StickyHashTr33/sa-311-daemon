@@ -6,29 +6,28 @@ import schedule
 from datetime import datetime, timedelta
 
 # --- CONFIGURATION ---
-WEBHOOK_URL = os.environ.get(
-    "DISCORD_WEBHOOK",
-    "https://discord.com/api/webhooks/1520195532432085104/RxlKK7bcFsqbJzB91uFZMMAqTR25msj2zfZ2ImSeE-41r8nJu5m1FO__s1oRk5zeuvdV"
-)
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK")
+if not WEBHOOK_URL:
+    raise RuntimeError("DISCORD_WEBHOOK environment variable is not set. Refusing to start.")
 
-SA_DATA_API = "https://data.sanantonio.gov/api/3/action/datastore_search_sql"
-# Paste the 32-character Resource ID from the SA Data Portal "Data API" button here
+SA_Data_API = "https://data.sanantonio.gov/api/3/action/datastore_search_sql"
 RESOURCE_ID = "20eb6d22-7eac-425a-85c1-fdb365fd3cd7"
 
-# A ZIP's daily call count must exceed its historical average by this factor to flag
 SPIKE_MULTIPLIER = 1.5
-# Minimum absolute calls before a ZIP is even considered (filters noise in low-traffic ZIPs)
 MIN_ABSOLUTE_THRESHOLD = 15
+
+DB_PATH = os.environ.get("DB_PATH", "data/baselines.db")
 
 
 def initialize_database():
     """Creates the local SQLite ledger that stores per-ZIP rolling baselines."""
-    with sqlite3.connect("baselines.db") as conn:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS zip_metrics (
-                zipcode     TEXT NOT NULL,
-                reason      TEXT NOT NULL,
-                total_calls INTEGER NOT NULL DEFAULT 0,
+                zipcode      TEXT NOT NULL,
+                reason       TEXT NOT NULL,
+                total_calls  INTEGER NOT NULL DEFAULT 0,
                 days_tracked INTEGER NOT NULL DEFAULT 0,
                 daily_average REAL NOT NULL DEFAULT 0.0,
                 PRIMARY KEY (zipcode, reason)
@@ -67,7 +66,6 @@ def fetch_and_analyze():
     print(f"[{datetime.now().isoformat(timespec='seconds')}] "
           f"Waking up — executing 4:20 AM delta check for {yesterday}...")
 
-    # 1. Pull yesterday's call counts grouped by ZIP and reason
     sql = (
         f'SELECT "ZIPCODE", "REASON", COUNT(*) as call_count '
         f'FROM "{RESOURCE_ID}" '
@@ -76,7 +74,7 @@ def fetch_and_analyze():
     )
 
     try:
-        resp = requests.get(SA_DATA_API, params={"sql": sql}, timeout=30)
+        resp = requests.get(SA_Data_API, params={"sql": sql}, timeout=30)
         resp.raise_for_status()
         records = resp.json().get("result", {}).get("records", [])
     except Exception as exc:
@@ -87,9 +85,8 @@ def fetch_and_analyze():
         print("No records returned for yesterday. Returning to sleep.")
         return
 
-    # 2. Delta check against stored baselines; update baselines afterward
     anomalies = []
-    with sqlite3.connect("baselines.db") as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         for row in records:
             zipcode = str(row.get("ZIPCODE", "UNKNOWN")).strip()
             reason = str(row.get("REASON", "UNKNOWN")).strip()
@@ -101,7 +98,6 @@ def fetch_and_analyze():
             ).fetchone()
 
             if baseline_row and baseline_row[1] >= 7:
-                # Only flag once we have a week of history to compare against
                 avg = baseline_row[0]
                 if count >= MIN_ABSOLUTE_THRESHOLD and count > avg * SPIKE_MULTIPLIER:
                     anomalies.append({
@@ -112,7 +108,6 @@ def fetch_and_analyze():
                         "pct": round((count / avg - 1) * 100),
                     })
             elif count >= MIN_ABSOLUTE_THRESHOLD:
-                # No history yet — flag anything above the hard floor during bootstrap
                 anomalies.append({
                     "zipcode": zipcode,
                     "reason": reason,
@@ -124,12 +119,11 @@ def fetch_and_analyze():
             _update_baseline(conn, zipcode, reason, count)
         conn.commit()
 
-    # 3. Build and dispatch the Discord payload
     if not anomalies:
         print("No localized anomalies detected. Returning to sleep.")
         return
 
-    lines = [f"### \U0001f6a8 311 Municipal Anomaly Report", f"**Date:** {yesterday}", ""]
+    lines = ["### \U0001f6a8 311 Municipal Anomaly Report", f"**Date:** {yesterday}", ""]
     for a in sorted(anomalies, key=lambda x: x["count"], reverse=True):
         if a["pct"] is not None:
             lines.append(
